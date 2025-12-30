@@ -1,0 +1,446 @@
+# Patch: Replace `study_assistant.c` with the fixed version
+# Usage (PowerShell):
+# 1. Backup existing file (optional):
+#    Copy-Item -Path 'E:\project\study_assistant.c' -Destination 'E:\project\study_assistant.c.bak'
+# 2. Overwrite the file with the fixed content below (run the following in PowerShell):
+#
+# $content = @'
+# [START OF FILE CONTENT]
+# (the block below this line up to [END OF FILE CONTENT])
+# '@
+# Set-Content -Path 'E:\project\study_assistant.c' -Value $content -Encoding UTF8
+#
+# 3. (Optional) Commit with git if available:
+#    Set-Location -Path 'E:\project'
+#    git add study_assistant.c
+#    git commit -m "Fix: EOF-safe input handling, parent-folder fallback, heap allocations, and input robustness"
+#
+# --- Begin file content (paste the block between the markers into the $content here-string) ---
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <stdbool.h>
+
+#define MAX_TEXT_SIZE 500000
+#define MAX_WORD_LEN 100
+#define MAX_WORDS 20000
+#define MAX_SENTENCES 5000
+
+typedef struct {
+    char word[MAX_WORD_LEN];
+    int count;
+} WordCount;
+
+typedef struct {
+    char *text;
+    int score;
+    int index;
+} Sentence;
+
+void normalize_token(char *s) {
+    int i = 0, j = 0;
+    int len = strlen(s);
+    while (i < len && ispunct((unsigned char)s[i])) i++;
+    for (; i < len; i++) {
+        char c = s[i];
+        if (isalnum((unsigned char)c) || c=='\'' || c=='-') {
+            s[j++] = tolower((unsigned char)c);
+        } else break;
+    }
+    s[j] = '\0';
+}
+
+char *read_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    if (fsize > MAX_TEXT_SIZE) { fclose(f); return NULL; }
+    fseek(f, 0, SEEK_SET);
+    char *buf = malloc((size_t)fsize + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t read = fread(buf, 1, (size_t)fsize, f);
+    buf[read] = '\0';
+    fclose(f);
+    return buf;
+}
+
+int split_sentences(char *text, Sentence sentences[], int max_sentences) {
+    int count = 0;
+    char *p = text;
+    char *start = p;
+    while (*p) {
+        if ((*p == '.' || *p == '?' || *p == '!')) {
+            char *end = p;
+            p++;
+            while (*p && isspace((unsigned char)*p)) p++;
+            size_t len = (size_t)(end - start + 1);
+            if (len > 0 && count < max_sentences) {
+                sentences[count].text = malloc(len + 1);
+                if (!sentences[count].text) break;
+                strncpy(sentences[count].text, start, len);
+                sentences[count].text[len] = '\0';
+                sentences[count].score = 0;
+                sentences[count].index = count;
+                count++;
+            }
+            start = p;
+            continue;
+        } else p++;
+    }
+    if (*start && count < max_sentences) {
+        size_t len = strlen(start);
+        sentences[count].text = malloc(len + 1);
+        if (sentences[count].text) {
+            strcpy(sentences[count].text, start);
+            sentences[count].score = 0;
+            sentences[count].index = count;
+            count++;
+        }
+    }
+    return count;
+}
+
+void free_sentences(Sentence sentences[], int n) {
+    for (int i=0;i<n;i++) free(sentences[i].text);
+}
+
+int add_word(WordCount words[], int *unique_words, const char *w) {
+    if (strlen(w) == 0) return -1;
+    for (int i = 0; i < *unique_words; i++) {
+        if (strcmp(words[i].word, w) == 0) {
+            words[i].count++;
+            return i;
+        }
+    }
+    if (*unique_words >= MAX_WORDS) return -1;
+    strncpy(words[*unique_words].word, w, MAX_WORD_LEN-1);
+    words[*unique_words].word[MAX_WORD_LEN-1] = '\0';
+    words[*unique_words].count = 1;
+    (*unique_words)++;
+    return (*unique_words)-1;
+}
+
+void build_word_frequency(const char *text, WordCount words[], int *unique_words) {
+    *unique_words = 0;
+    char token[MAX_WORD_LEN];
+    int ti = 0;
+    for (const char *p = text; ; p++) {
+        char c = *p;
+        if (isalnum((unsigned char)c) || c=='\'' || c=='-') {
+            if (ti < MAX_WORD_LEN-1) token[ti++] = tolower((unsigned char)c);
+        } else {
+            if (ti > 0) {
+                token[ti] = '\0';
+                char tmp[MAX_WORD_LEN];
+                strcpy(tmp, token);
+                normalize_token(tmp);
+                if (strlen(tmp) > 0) add_word(words, unique_words, tmp);
+                ti = 0;
+            }
+            if (c == '\0') break;
+        }
+    }
+}
+
+int find_word_count(WordCount words[], int unique_words, const char *w) {
+    for (int i=0;i<unique_words;i++) if (strcmp(words[i].word, w) == 0) return words[i].count;
+    return 0;
+}
+
+void score_sentences(Sentence sentences[], int sent_count, WordCount words[], int unique_words) {
+    for (int i=0;i<sent_count;i++) {
+        int score = 0;
+        char buf[1024];
+        strncpy(buf, sentences[i].text, 1023);
+        buf[1023] = '\0';
+        char *p = buf;
+        char token[MAX_WORD_LEN]; int ti=0;
+        while (*p) {
+            char c = *p;
+            if (isalnum((unsigned char)c) || c=='\'' || c=='-') token[ti++] = tolower((unsigned char)c);
+            else {
+                if (ti>0) {
+                    token[ti]='\0';
+                    char tmp[MAX_WORD_LEN]; strcpy(tmp, token); normalize_token(tmp);
+                    if(strlen(tmp)>0) score+=find_word_count(words, unique_words, tmp);
+                    ti=0;
+                }
+            }
+            p++;
+        }
+        if(ti>0){token[ti]='\0'; char tmp[MAX_WORD_LEN]; strcpy(tmp, token); normalize_token(tmp); if(strlen(tmp)>0) score+=find_word_count(words, unique_words, tmp);}
+        sentences[i].score=score;
+    }
+}
+
+int select_top_sentences(Sentence sentences[], int sent_count, int N, Sentence out[]) {
+    int selected = 0;
+    bool used[MAX_SENTENCES]={0};
+    for(int k=0;k<N && k<sent_count;k++){
+        int best=-1,best_score=-1;
+        for(int i=0;i<sent_count;i++){
+            if(used[i]) continue;
+            if(sentences[i].score>best_score){best_score=sentences[i].score; best=i;}
+        }
+        if(best==-1) break;
+        used[best]=true;
+    }
+    for(int i=0;i<sent_count;i++){
+        if(used[i]){
+            out[selected].text=malloc(strlen(sentences[i].text)+1);
+            strcpy(out[selected].text,sentences[i].text);
+            out[selected].score=sentences[i].score;
+            out[selected].index=sentences[i].index;
+            selected++;
+        }
+    }
+    for(int i=0;i<selected;i++){
+        for(int j=i+1;j<selected;j++){
+            if(out[i].index>out[j].index){Sentence tmp=out[i]; out[i]=out[j]; out[j]=tmp;}
+        }
+    }
+    return selected;
+}
+
+int top_k_words(WordCount words[], int unique_words, int K, WordCount out_words[]){
+    bool used[MAX_WORDS]={0};
+    int out_count=0;
+    for(int k=0;k<K && k<unique_words;k++){
+        int best=-1,bestc=-1;
+        for(int i=0;i<unique_words;i++){
+            if(used[i]) continue;
+            if(words[i].count>bestc){bestc=words[i].count; best=i;}
+        }
+        if(best==-1) break;
+        used[best]=true;
+    }
+    for(int i=0;i<unique_words;i++){
+        if(used[i]) out_words[out_count++]=words[i];
+    }
+    for(int i=0;i<out_count;i++){
+        for(int j=i+1;j<out_count;j++){
+            if(out_words[i].count<out_words[j].count){WordCount tmp=out_words[i]; out_words[i]=out_words[j]; out_words[j]=tmp;}
+        }
+    }
+    return out_count;
+}
+
+int generate_quiz_from_keywords(WordCount top_words[], int top_count, Sentence sentences[], int sent_count, Sentence quiz_sentences[], char answers[][MAX_WORD_LEN]){
+    int qcount=0;
+    for(int k=0;k<top_count;k++){
+        char *kw=top_words[k].word; bool found=false;
+        for(int s=0;s<sent_count && !found;s++){
+            char buf[2048]; strncpy(buf,sentences[s].text,2047); buf[2047]='\0';
+            char *p=buf; char token[MAX_WORD_LEN]; int ti=0; bool contains=false;
+            while(*p){
+                char c=*p;
+                if(isalnum((unsigned char)c) || c=='\'' || c=='-') token[ti++]=tolower((unsigned char)c);
+                else {
+                    if(ti>0){token[ti]='\0'; char tmp[MAX_WORD_LEN]; strcpy(tmp,token); normalize_token(tmp); if(strlen(tmp)>0 && strcmp(tmp,kw)==0) contains=true; ti=0;}
+                }
+                p++;
+            }
+            if(ti>0 && !contains){token[ti]='\0'; char tmp[MAX_WORD_LEN]; strcpy(tmp,token); normalize_token(tmp); if(strcmp(tmp,kw)==0) contains=true;}
+            if(contains){
+                char *orig=sentences[s].text;
+                char *lower=malloc(strlen(orig)+1);
+                for(size_t i=0;i<strlen(orig);i++) lower[i]=tolower((unsigned char)orig[i]);
+                lower[strlen(orig)]='\0';
+                char find[MAX_WORD_LEN]; strcpy(find, kw);
+                char *pos=strstr(lower, find);
+                if(pos){
+                    int idx=(int)(pos-lower);
+                    char newsen[4096]; newsen[0]=0;
+                    strncat(newsen, orig, idx); strcat(newsen,"____"); strcat(newsen,orig+idx+strlen(find));
+                    quiz_sentences[qcount].text=malloc(strlen(newsen)+1); strcpy(quiz_sentences[qcount].text,newsen);
+                    strcpy(answers[qcount], kw); qcount++; found=true; free(lower); break;
+                }
+                free(lower);
+            }
+        }
+    }
+    return qcount;
+}
+
+void save_sentences_to_file(const char *path, Sentence arr[], int n){
+    FILE *f=fopen(path,"w");
+    if(!f){printf("Error: cannot open %s for writing.\n",path); return;}
+    for(int i=0;i<n;i++) fprintf(f,"%s\n",arr[i].text);
+    fclose(f);
+}
+
+void print_top_words(WordCount words[], int unique_words, int topN){
+    WordCount *tmp = malloc(sizeof(WordCount) * MAX_WORDS);
+    if (!tmp) {
+        printf("Error: cannot allocate temporary buffer for top words.\n");
+        return;
+    }
+    int k = top_k_words(words, unique_words, topN, tmp);
+    printf("\nTop %d keywords (by frequency):\n", k);
+    for (int i = 0; i < k; i++) printf("  %d. %-20s  (%d)\n", i+1, tmp[i].word, tmp[i].count);
+    free(tmp);
+}
+
+void print_menu(){
+    printf("\n===== Smart Personal Study Assistant =====\n");
+    printf("1. Load notes from file\n");
+    printf("2. Show top keywords\n");
+    printf("3. Generate summary\n");
+    printf("4. Generate quiz (fill-in-the-blank)\n");
+    printf("5. Save summary and quiz to files\n");
+    printf("6. Exit\n");
+    printf("Choose an option: ");
+}
+
+int main(){
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stdin, NULL, _IONBF, 0);
+
+    char filepath[512], line[512];
+    char *text=NULL;
+    WordCount *words = malloc(sizeof(WordCount) * MAX_WORDS);
+    if (!words) { fprintf(stderr, "Error: failed to allocate memory for words.\n"); return 1; }
+    int unique_words=0;
+    Sentence sentences[MAX_SENTENCES];
+    int sent_count=0;
+    Sentence summary_sentences[MAX_SENTENCES];
+    int summary_count=0;
+    Sentence quiz_sentences[MAX_SENTENCES];
+    char quiz_answers[100][MAX_WORD_LEN];
+    int quiz_count=0;
+    bool loaded=false, summary_ready=false, quiz_ready=false;
+
+    while(1){
+        print_menu();
+        if(!fgets(line,sizeof(line),stdin)){
+            if (feof(stdin)) { printf("\nEOF on input, exiting.\n"); break; }
+            clearerr(stdin);
+            continue;
+        }
+        int choice;
+        if(sscanf(line,"%d",&choice)!=1) continue;
+
+        if(choice==1){
+            printf("Enter path to text file with notes (e.g., notes.txt): ");
+            if(!fgets(filepath,sizeof(filepath),stdin)){
+                if (feof(stdin)) { printf("\nEOF on input, exiting.\n"); break; }
+                clearerr(stdin);
+                continue;
+            }
+            filepath[strcspn(filepath,"\r\n")]=0;
+            if(text){free(text); text=NULL;}
+            text=read_file(filepath);
+            if(!text){
+                /* try parent-folder fallback (useful when running from output/ folder) */
+                char altpath[1024];
+                snprintf(altpath, sizeof(altpath), "..%c%s", '/', filepath);
+                text = read_file(altpath);
+                if (text) {
+                    printf("File loaded from parent folder: %s (%zu bytes).\n", altpath, strlen(text));
+                    strncpy(filepath, altpath, sizeof(filepath)-1); filepath[sizeof(filepath)-1]=0;
+                } else {
+                    printf("Failed to read file or file too large.\n"); loaded=false; continue;
+                }
+            }
+            printf("File loaded (%zu bytes).\n",strlen(text));
+            build_word_frequency(text, words,&unique_words);
+            char *text_copy=malloc(strlen(text)+1); strcpy(text_copy,text);
+            sent_count=split_sentences(text_copy,sentences,MAX_SENTENCES);
+            score_sentences(sentences,sent_count,words,unique_words);
+            free(text_copy); loaded=true; summary_ready=false; quiz_ready=false;
+
+        } else if(choice==2){
+            if(!loaded){printf("Load a file first (option 1).\n"); continue;}
+            printf("How many top keywords to show? (e.g., 10): ");
+            if(!fgets(line,sizeof(line),stdin)){
+                if (feof(stdin)) { printf("\nEOF on input, exiting.\n"); break; }
+                clearerr(stdin);
+                continue;
+            }
+            int topN; if(sscanf(line,"%d",&topN)!=1) continue;
+            print_top_words(words,unique_words,topN);
+
+        } else if(choice==3){
+            if(!loaded){printf("Load a file first (option 1).\n"); continue;}
+            printf("How many sentences should the summary have? (e.g., 3): ");
+            if(!fgets(line,sizeof(line),stdin)){
+                if (feof(stdin)) { printf("\nEOF on input, exiting.\n"); break; }
+                clearerr(stdin);
+                continue;
+            }
+            int num_sent; if(sscanf(line,"%d",&num_sent)!=1) continue;
+            summary_count=select_top_sentences(sentences,sent_count,num_sent,summary_sentences);
+            if(summary_count==0) printf("Could not create summary.\n");
+            else{
+                printf("\n--- Summary ---\n");
+                for(int i=0;i<summary_count;i++) printf("%s\n",summary_sentences[i].text);
+                summary_ready=true;
+            }
+
+        } else if(choice==4){
+            if(!loaded){printf("Load a file first (option 1).\n"); continue;}
+            printf("How many keywords to use for quiz? (e.g., 5): ");
+            if(!fgets(line,sizeof(line),stdin)){
+                if (feof(stdin)) { printf("\nEOF on input, exiting.\n"); break; }
+                clearerr(stdin);
+                continue;
+            }
+            int topk; if(sscanf(line,"%d",&topk)!=1) continue;
+            WordCount top_words[100]; int got=top_k_words(words,unique_words,topk,top_words);
+            quiz_count=generate_quiz_from_keywords(top_words,got,sentences,sent_count,quiz_sentences,quiz_answers);
+            if(quiz_count==0) printf("No suitable sentences found for quiz.\n");
+            else{
+                printf("\n--- Quiz (Fill in the blank) ---\n");
+                for(int i=0;i<quiz_count;i++) printf("%d) %s\n",i+1,quiz_sentences[i].text);
+                printf("\n(Answers hidden; choose option 5 to save and view answers file)\n");
+                quiz_ready=true;
+            }
+
+        } else if(choice==5){
+            if(!summary_ready && !quiz_ready){printf("Nothing ready to save.\n"); continue;}
+            char outsum[512], outquiz[512], outans[512];
+            printf("Enter filename to save summary (e.g., summary.txt): ");
+            if(!fgets(outsum,sizeof(outsum),stdin)){
+                if (feof(stdin)) { printf("\nEOF on input, exiting.\n"); break; }
+                clearerr(stdin);
+                continue;
+            }
+            outsum[strcspn(outsum,"\r\n")]=0;
+            printf("Enter filename to save quiz (e.g., quiz.txt): ");
+            if(!fgets(outquiz,sizeof(outquiz),stdin)){
+                if (feof(stdin)) { printf("\nEOF on input, exiting.\n"); break; }
+                clearerr(stdin);
+                continue;
+            }
+            outquiz[strcspn(outquiz,"\r\n")]=0;
+            printf("Enter filename to save quiz answers (e.g., answers.txt): ");
+            if(!fgets(outans,sizeof(outans),stdin)){
+                if (feof(stdin)) { printf("\nEOF on input, exiting.\n"); break; }
+                clearerr(stdin);
+                continue;
+            }
+            outans[strcspn(outans,"\r\n")]=0;
+            if(summary_ready){save_sentences_to_file(outsum,summary_sentences,summary_count); printf("Summary saved to %s\n",outsum);}
+            if(quiz_ready){
+                save_sentences_to_file(outquiz,quiz_sentences,quiz_count);
+                FILE *fa=fopen(outans,"w");
+                if(fa){for(int i=0;i<quiz_count;i++) fprintf(fa,"%d) %s\n",i+1,quiz_answers[i]); fclose(fa); printf("Quiz saved to %s and answers to %s\n",outquiz,outans);}
+            }
+
+        } else if(choice==6){printf("Exiting. Goodbye!\n"); break;}
+        else printf("Invalid choice. Try again.\n");
+    }
+
+    if(text) free(text);
+    free_sentences(sentences,sent_count);
+    for(int i=0;i<summary_count;i++) free(summary_sentences[i].text);
+    for(int i=0;i<quiz_count;i++) free(quiz_sentences[i].text);
+    free(words);
+
+    return 0;
+}
+
+# --- End file content
